@@ -20,7 +20,7 @@ This RMarkdown report shows the complete code to compute hourly quality control 
 
 ```{r echo=FALSE}
 data_to_dthm <- function(df) { ymd_hms(paste(df$date, df$hm)) }
-file_name = "10347392.tsv"
+file_name = "data/10347392.tsv"
 df_raw <- read_tsv(file_name, skip=5)
 data_interval <- interval(ymd_hm('2018-12-10 00:00'), ymd_hm('2019-01-06 23:50'))
 df <- df_raw[data_to_dthm(df_raw) %within% data_interval,]  # Get correct interval
@@ -165,8 +165,8 @@ df_hourly
 
 ```{r echo=FALSE}
 data_to_dthm <- function(df) { ymd_hms(paste(df$date, df$hm)) }
-df_wbi <- read_tsv("dwd_01443.tsv")  # DWD-ID 1443
-df_ws <- read_tsv("dwd_13667.tsv")   # DWD-ID 13667
+df_wbi <- read_tsv("data/dwd_01443.tsv")  # DWD-ID 1443
+df_ws <- read_tsv("data/dwd_13667.tsv")   # DWD-ID 13667
 # verify that hourly time stamps match the HOBO data
 hourly_time_seq <- seq(ymd_h('2018-12-10 00'), ymd_h('2019-01-06 23'), by='60 mins')
 stopifnot(data_to_dthm(df_ws) == hourly_time_seq, data_to_dthm(df_wbi) == hourly_time_seq)
