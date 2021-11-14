@@ -1,0 +1,286 @@
+---
+title: "Quality control and Quality assurance for climate data"
+author: "Ifeanyi Nwasolu"
+date: "13/11/2021"
+output: html_document
+---
+
+```{r eval=TRUE, include=FALSE,}
+library(tidyverse)
+library(dplyr)
+library(lubridate) 
+library(zoo)
+library(rio)
+library(RColorBrewer)
+require(latex2exp)
+
+```
+
+This RMarkdown report shows the complete code to compute hourly quality control for temperature indices. The first step is to download the data from HOBO 10347392 and cut the series to the correct interval. Next, a helper function is created to get the date, hour, and minute time stamp.
+
+```{r echo=FALSE}
+data_to_dthm <- function(df) { ymd_hms(paste(df$date, df$hm)) }
+file_name = "10347392.tsv"
+df_raw <- read_tsv(file_name, skip=5)
+data_interval <- interval(ymd_hm('2018-12-10 00:00'), ymd_hm('2019-01-06 23:50'))
+df <- df_raw[data_to_dthm(df_raw) %within% data_interval,]  # Get correct interval
+df$id <- df$id - (df$id[1] - 1)  # shift the ids, to cut some of the first points
+df <- df %>% mutate(dthm=data_to_dthm(df))  # create a single column time stamp
+df
+```
+
+
+## Quality Control
+In this section, quality control checks are implemented for weather data. functions returning a boolean vector are created, where TRUE means the respective point failed the check. The idea here is that sum up the fails for each point can be used later on.
+
+#### Measurement range (Plausible values)
+The first check, i.e., the temperature must be between $-20\text{°}C$ and $-70\text{°}C$, the light intensity between 0 and 320000 lux.
+
+```{r echo=FALSE}
+# Not in measurement range
+not_valid <- function(df) {
+  !between(df$ta, -20, 70)  | !between(df$lux, 0, 320000)
+}
+```
+
+#### 1.2 Plausible rate of change
+The next check returns `TRUE` if the change between two neighboring points is unreasonably large. 
+
+```{r echo=FALSE}
+# Rate of change not plausible
+not_plausible <- function(x) { abs(x - lag(x)) > 1 }
+```
+
+#### 1.3 Minimum variability (Persistence)
+This check returns `TRUE` if values do not change within the last 60 minutes. To account for floating point rounding errors, we check if the variance of the last 60 minutes is smaller than a given tolerance.
+
+
+```{r echo=FALSE}
+# No minimum variability
+no_min_var <- function(x, tolerance = 1e-11) {
+  rollapplyr(x, width=6, FUN={function(x) var(x) < tolerance}, fill=NA)
+}
+
+```
+
+#### 1.4 Maximum variability (Consistency)
+This check returns `TRUE` if the difference between a point and its neighbors is larger than eight times the standard deviation $\sigma$ of the temperatur of the last hour. One of the downsides of this check is that it only considers the variance of the past hour and not the future, which results e.g. in points being flagged after sunrise. To counteract this, we chose $8\sigma$ over $4\sigma$ to reduce the number of reasonable points that are flagged.
+
+
+```{r echo=FALSE}
+
+na_to_val <- function(x, val=0) { ifelse(is.na(x), val, x) }
+over_maximum_variability <- function(x, sd_factor=8, eps=1e-9) {
+  # standard dev over 6 data points, excluding current point (shift by 1 with lag)
+  std_range6 <- lag(rollapplyr(x, width=6, FUN='sd', fill=NA))
+  # If the next or previous value is NA, we don't include it in the calculation.
+  # This means we need to (1) adapt the factor of the standard deviation accordingly
+  sd_factor = (!is.na(lag(x))) * (sd_factor / 2) + (!is.na(lead(x))) * (sd_factor / 2)
+  # and (2) replace NA values with 0 in the corresponding absolute difference
+  na_to_val(abs(x - lag(x))) + na_to_val(abs(x - lead(x))) > (sd_factor * std_range6) + eps
+}
+```
+
+
+
+```{r echo=FALSE}
+df <- df %>% mutate(dthm=ymd_hms(paste(date, hm)))
+df_var_plt <- df[df$dthm > "2018-12-23 00:00:00" & df$dthm < "2018-12-24 00:00:00",]
+sig_8 <- na_to_val(over_maximum_variability(df_var_plt$ta, 8), FALSE)
+sig_6 <- na_to_val(over_maximum_variability(df_var_plt$ta, 6), FALSE)
+sig_4 <- na_to_val(over_maximum_variability(df_var_plt$ta, 4), FALSE)
+df_long <- gather(df_var_plt %>% mutate(sig_8=sig_8, sig_6=sig_6, sig_4=sig_4), variable, value,        
+                  -c(dthm, ta, date, hm, lux, id))
+ggplot(data=df_long, aes(x = dthm, y = ta )) + 
+    geom_line(aes(x=dthm, y=ta)) +
+    geom_point(aes(color=variable, alpha=value), size=0.4) +
+    facet_wrap(~variable, nrow = 1) +
+    scale_alpha_discrete(range=c(0,1))
+```
+
+#### 1.5 Light intensity
+This check flags points with high light intensity as their temperature value might be influenced by direct radiation. For this, we compute the $0.95^\text{th}$ percentile of the light intensity (`r quantile(df$lux, .95)` Lux) and the $0.99^\text{th}$ percentile (`r quantile(df$lux, .99)` Lux), to then plot the temperature over time with the points highlighted if the corresponding light intensity is higher than these percentiles. We observe that points with high light intensity almost exlusively occur during longer, steep temperature ascents. However, our HOBO was mounted beneath a table, so direct irradiation could only influence the measurements for a very short time. Therefore, we choose the thresholds less aggressively as $L1=9300.1, L2=12000$.
+
+
+```{r echo=FALSE}
+qan <- quantile(df$lux, c(.95, .99))
+percentile <- case_when(df$lux < qan[1] ~ "rest", df$lux > qan[2] ~ "0.99", TRUE~"0.95")
+df_plot <- df %>%  mutate(percentile=percentile)
+ggplot(arrange(df_plot, desc(percentile)), aes(x=dthm, y=ta)) +
+  geom_point(aes(color=percentile), size=0.7) +
+  theme_bw() +
+  labs(title = "Temperature over time with light intensity percentile",
+       x = "date", y = "temperature in °C")
+```
+
+```{r echo=FALSE}
+# Inconsistent light intensity
+light_incon <- function(df, l1=9300.1, l2=12000) {
+  # flag a point if any of its next neighbors is larger l1
+  flag1 <- rollapply(df$lux > l1, width=1, align='center', FUN='any', partial=TRUE)
+  # flag a point if any of its next 3 neighbors is larger l2
+  flag2 <- rollapply(df$lux > l2, width=7, align='center', FUN='any', partial=TRUE)
+  # only apply the intensity check during day time
+  is_day <- hm('06:00') <= df$hm & df$hm <= hm('18:00')
+  flag1 & flag2 & is_day
+}
+```
+
+## 2. Flagging system to identify bad data
+After creating all quality control check functions, the functions will be used to identify bad data points from the dataset. A new columns for the flags will be created
+
+```{r echo=FALSE}
+df <- df %>% mutate(range_flag = not_valid(df)) %>% 
+             mutate(rate_change_flag = not_plausible(df$ta)) %>% 
+             mutate(ta_min_var_flag = no_min_var(df$ta)) %>% 
+             mutate(ta_max_var_flag = over_maximum_variability(df$ta, 8)) %>% 
+             mutate(light_intensity_flag = light_incon(df))
+# Compute the total number of flags. Sum up all the rows with names ending with "flag"
+df <- df %>% mutate(flag_count=rowSums(df[endsWith(names(df), "flag")], na.rm=TRUE))
+df
+```
+
+```{r echo=FALSE}
+num_points_per_check <- df[endsWith(names(df), "flag")] %>% summarise_all(sum, na.rm=TRUE)
+knitr::kable(num_points_per_check, col.names = c("range", "rate change", "persistence", "consistency", "intensity"))
+```
+
+We can observe that all measurements are within the range of the HOBOs specifications. Nearly all af the
+data points were flagged due to either temperature values not changing for an hour, or because of rapid
+temperature changes. Next, we aggregate values for each hour and flag hours where more than one check failed. This is the case for `r sum(df$flag_count > 1)` of `r length(df$th)` points.
+
+
+
+## 3  Filling gaps with a regression model
+As a last step to complete the hourly values, the flagged values are replaced with a linear model trained on reference weather stations. For this, the nearest nearest reference station (according to the HOBO location) was downloaded from https://www.dwd.de/DE/klimaumwelt/cdc/cdc_node.html(FREIBURG (DWD) with DWD-ID #1443 and FREIBURG-MITTE (DWD) with DWD-ID #13667
+
+```{r echo=FALSE}
+
+df_hourly <- df %>% group_by(date, hour=hour(hm)) %>%
+                    summarise(hm=min(hm), th=mean(ta), lux=mean(lux), flag_count=sum(flag_count))
+df_hourly$th[df_hourly$flag_count > 1] <- NA
+df_hourly
+```
+
+
+```{r echo=FALSE}
+data_to_dthm <- function(df) { ymd_hms(paste(df$date, df$hm)) }
+df_wbi <- read_tsv("dwd_01443.tsv")  # DWD-ID 1443
+df_ws <- read_tsv("dwd_13667.tsv")   # DWD-ID 13667
+# verify that hourly time stamps match the HOBO data
+hourly_time_seq <- seq(ymd_h('2018-12-10 00'), ymd_h('2019-01-06 23'), by='60 mins')
+stopifnot(data_to_dthm(df_ws) == hourly_time_seq, data_to_dthm(df_wbi) == hourly_time_seq)
+# write all hourly series into one dataframe
+df_combined <- df %>% inner_join(df_wbi, by=c("date", "hm"), suffix=c("", "_wbi")) %>% 
+                             inner_join(df_ws, by=c("date", "hm"), suffix=c("", "_ws")) %>% 
+                             mutate(dthm=ymd_hms(paste(date, hm)))
+df_combined
+```
+
+We train two linear models: on the weather service data (WS) and on the Weinbau Institute data (WBI).
+
+```{r echo=FALSE}
+model_wbi <- lm(formula = ta ~ ta_wbi, data=df_combined)
+model_ws <- lm(formula = ta ~ ta_ws, data=df_combined)
+# Get summaries
+s_wbi <- summary(model_wbi)
+s_ws <- summary(model_ws)  
+```
+
+```{r echo=FALSE}
+require(gridExtra)
+pal <- brewer.pal(n = 8, name = 'RdBu')
+p1 <- ggplot(arrange(df_combined, flag_count), aes(x=th_wbi, y=th)) +
+  geom_point(aes(x=ta_wbi, y=ta), color=pal[3], alpha=0.5, size=1) +
+  geom_point(aes(x=ta_ws, y=ta, color=(flag_count>=1)), color=pal[6], alpha=0.5, size=1) +
+  geom_abline(intercept=as.numeric(model_wbi$coefficients[1]),
+              slope=as.numeric(model_wbi$coefficients[2]), color=pal[1], size=1) + 
+  geom_abline(intercept=as.numeric(model_ws$coefficients[1]),
+              slope=as.numeric(model_ws$coefficients[2]), color=pal[8], size=1) +
+  theme_bw(base_size = 8) +
+  labs(title="both models", x = "temp. in °C", y = "temp. in °C (HOBO)")
+p2 <- ggplot(arrange(df_combined, flag_count), aes(x=ta_ws, y=ta)) +
+  geom_point(aes(x=ta_ws, y=ta, color=(flag_count>=1)), color=pal[6], size=1) +
+  geom_abline(intercept=as.numeric(model_ws$coefficients[1]),
+              slope=as.numeric(model_ws$coefficients[2]), color=pal[8], size=1) +
+  theme_bw(base_size = 8) + labs(title="weather service", y = "", x = "temp. in °C (WS)")
+p3 <- ggplot(arrange(df_combined, flag_count), aes(x=ta_wbi, y=ta)) +
+  geom_point(aes(x=ta_wbi, y=ta), color=pal[3], size=1) +
+  geom_abline(intercept=as.numeric(model_wbi$coefficients[1]),
+              slope=as.numeric(model_wbi$coefficients[2]), color=pal[1], size=1) +
+  theme_bw(base_size = 8) + labs(title="weinbau institute", y = "", x = "temp. in °C (WBI)")
+grid.arrange(p1, p3, p2, ncol=3)
+```
+
+In general, the higher the R-squared the better the model fits the data. The model trained on the DWD-ID 1443 data has a R-squared ($R^2$) of `r I(round(s_wbi$r.squared, 3))`, the model trained on DWD-ID 13667 data has an $R^2$ value of `r I(round(s_ws$r.squared, 3))`, which votes for the DWD-ID 13667 model. Notwithstanding, both models show similar fit to the data as seen from the visual inspection of the residuals in the plot above. Also, both models tend to underestimate the temperature in the range of 5°C to 10°C. The DWD-ID 13667 model will be used to fill the flagged data points. Therefore, the NA values are replace with the model predictions.
+
+```{r echo=FALSE}
+prediction <- predict(model_ws, df_combined[,"ta_ws"])
+df_hourly <- df_hourly %>% mutate(origin=ifelse(flag_count > 1, 'R', 'H'))
+df_hourly$th[df_hourly$flag_count > 1] <- prediction[df_hourly$flag_count > 1]
+write_tsv(df_hourly %>% dplyr::select(-one_of("hm", "lux", "flag_count")) %>% 
+                        mutate(th=round(th, 3)), "10347392_Th.tsv")
+```
+
+## Compute Indicies
+The next step after filling the flagged data with the model predictions is to get the various indices from the hourly dataset. The indicies are computed below...
+
+```{r echo=FALSE}
+df_hourly <- read_tsv("10347392_Th.tsv")
+```
+
+#### Mean temperature
+
+```{r echo=FALSE}
+mean_ta <- mean(df_hourly$th, na.rm=TRUE)
+mean_ta
+```
+The mean temperature is $T_{\text{AVG}}=$ `r round(mean_ta, 4)`$^\circ C$.
+
+#### Mean daily amplitude
+```{r echo=FALSE}
+ta_amplitude <- as.numeric(df_hourly %>% group_by(date) %>%
+                              summarise(max_ta=max(th), min_ta=min(th)) %>%
+                              summarise(mean(max_ta - min_ta)))
+ta_amplitude
+```
+The daily amplitude of the temperature is $T_{\text{AMP}}=$ `r round(ta_amplitude, 4)` $^\circ C$.
+
+#### Coefficient of variation
+```{r echo=FALSE}
+coef_variation <- sd(df_hourly$th) / mean(df_hourly$th)
+coef_variation
+```
+The coefficient of variation is $T_{\text{CV}} = \frac{\sigma_T}{\mu_T}=$ `r round(coef_variation, 4)`.
+
+#### Flashiness
+```{r}
+flashiness <- mean(abs((df_hourly$th - lag(df_hourly$th)))[-(1:1)])
+flashiness
+```
+The flashiness index of the temperatue is $T_{\text{FL}}=\frac{\sum_{i=2}^n |T_i - T_{i-1}}{n-1}=$ `r round(flashiness, 4)`.
+
+#### Most rapid temperature change
+```{r}
+highest_ta_change <- max(rollapplyr(df_hourly$th, width=6,
+                                    FUN={function(x) max(x) - min(x)}))
+highest_ta_change
+```
+The most rapid temperature change within six hours is `r round(highest_ta_change, 4)`$^\circ C$.
+
+#### Average day and night temperature
+```{r}
+mean_ta_day <- mean(filter(df_hourly, 6 <= hour & hour < 18)$th)
+mean_ta_night <- mean(filter(df_hourly, 18 <= hour | hour < 6)$th)
+```
+The average temperature during day time is `r round(mean_ta_day, 4)`$^\circ C$ and the average temperature during night is `r round(mean_ta_night, 4)`$^\circ C$.
+
+#### Fraction of NA-Values
+```{r}
+fraction_nas <- mean(df_hourly$origin == 'R')
+```
+Out of `r length(df_hourly$origin)` temperature values `r sum(df_hourly$origin == 'R')` were flagged and set to NA, that means that the `r round(fraction_nas, 4)` \% of the data points result from  regression.
+
+
+
+
