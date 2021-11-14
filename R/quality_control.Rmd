@@ -2,7 +2,7 @@
 title: "Quality control and Quality assurance for climate data"
 author: "Ifeanyi Nwasolu"
 date: "13/11/2021"
-output: html_document
+output: rmarkdown::github_document
 ---
 
 ```{r eval=TRUE, include=FALSE,}
